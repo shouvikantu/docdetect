@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
+from utils.gpu_forensics import GPUForensicFeatures
+
 
 # ---------------------------------------------------------------------------
 # Helper: Lateral + FPN decoder (UPerNet-style)
@@ -123,8 +125,16 @@ class SwinForensic(nn.Module):
         in_channels: int = 6,
         fpn_dim: int = 256,
         num_classes: int = 1,
+        gpu_forensics: bool = False,
     ) -> None:
         super().__init__()
+        self.gpu_forensics = gpu_forensics
+
+        # When gpu_forensics=True, input is 3ch RGB and we compute
+        # forensic features on GPU, then concat to get 6ch internally.
+        if gpu_forensics:
+            self.forensic_module = GPUForensicFeatures()
+            in_channels = 6  # Always 6ch to the backbone
 
         # --- Backbone (feature extractor) ---
         # When pretrained, load with 3 channels first so we get proper ImageNet weights,
@@ -215,6 +225,13 @@ class SwinForensic(nn.Module):
         """
         B, C, H, W = x.shape
 
+        # If using GPU forensics, compute forensic channels on the fly
+        if self.gpu_forensics and C == 3:
+            with torch.no_grad():
+                forensic = self.forensic_module(x)  # (B, 3, H, W)
+            x = torch.cat([x, forensic], dim=1)     # (B, 6, H, W)
+            C = 6
+
         # Multi-scale features from backbone (timm Swin outputs NHWC)
         features: List[torch.Tensor] = self.backbone(x)
         # Permute from NHWC to NCHW for conv layers
@@ -241,9 +258,15 @@ class SwinForensic(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Test standard 6-channel mode
     model = SwinForensic(pretrained=False)
     dummy = torch.randn(2, 6, 256, 256)
     result = model(dummy)
-    print(f"Input  shape: {dummy.shape}")
-    print(f"Output shape: {result['seg'].shape}")
-    print(f"Parameters  : {sum(p.numel() for p in model.parameters()):,}")
+    print(f"[6ch] Input: {dummy.shape} -> Output: {result['seg'].shape}")
+
+    # Test GPU forensics mode (3-channel RGB input)
+    model_fast = SwinForensic(pretrained=False, gpu_forensics=True)
+    dummy_rgb = torch.randn(2, 3, 256, 256)
+    result_fast = model_fast(dummy_rgb)
+    print(f"[3ch+GPU] Input: {dummy_rgb.shape} -> Output: {result_fast['seg'].shape}")
+    print(f"Parameters: {sum(p.numel() for p in model_fast.parameters()):,}")

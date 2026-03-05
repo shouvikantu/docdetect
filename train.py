@@ -26,6 +26,7 @@ from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from data.lmdb_dataset import DocTamperLMDBDataset
+from data.fast_dataset import FastLMDBDataset
 from models.swin_forensic import SwinForensic
 
 
@@ -239,6 +240,9 @@ def main():
 
     # Performance
     parser.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2.0+, ~20-30%% speedup)")
+    parser.add_argument("--fast", action="store_true",
+        help="Use fast pipeline: 3ch RGB data loading + GPU forensic computation. "
+             "~5-10x faster data pipeline. Recommended for GPU training.")
 
     # Debug
     parser.add_argument("--max_steps", type=int, default=-1, help="Max steps per epoch (debug)")
@@ -269,8 +273,12 @@ def main():
         print(f"Using device: {device} (FP32)")
 
     # --- Datasets ---
+    DatasetClass = FastLMDBDataset if args.fast else DocTamperLMDBDataset
+    mode_label = "FAST (RGB + GPU forensics)" if args.fast else "Standard (6ch CPU forensics)"
+    print(f"Pipeline mode: {mode_label}")
+
     print("Loading training dataset...")
-    train_ds = DocTamperLMDBDataset(
+    train_ds = DatasetClass(
         lmdb_path=args.train_lmdb,
         image_size=args.image_size,
         split="train",
@@ -278,13 +286,14 @@ def main():
     print(f"  Training samples: {len(train_ds)}")
 
     print("Loading validation dataset...")
-    val_ds = DocTamperLMDBDataset(
+    val_ds = DatasetClass(
         lmdb_path=args.val_lmdb,
         image_size=args.image_size,
         split="val",
     )
     print(f"  Validation samples: {len(val_ds)}")
 
+    use_persistent = args.num_workers > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -292,6 +301,8 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         drop_last=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=4 if use_persistent else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -299,6 +310,8 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=use_persistent,
+        prefetch_factor=4 if use_persistent else None,
     )
 
     # --- Model ---
@@ -307,6 +320,7 @@ def main():
         backbone_name=args.backbone,
         pretrained=not args.no_pretrained,
         fpn_dim=args.fpn_dim,
+        gpu_forensics=args.fast,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
