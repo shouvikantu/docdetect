@@ -118,6 +118,7 @@ def train_one_epoch(
     epoch: int,
     max_steps: int = -1,
     grad_clip: float = 1.0,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict:
     """Train for one epoch. Returns average loss & metrics."""
     model.train()
@@ -135,7 +136,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        with autocast(device_type=device.type, enabled=(device.type == "cuda")):
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
             output = model(images)
             loss = criterion(output["seg"], masks)
 
@@ -168,6 +169,7 @@ def validate(
     device: torch.device,
     epoch: int,
     max_steps: int = -1,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict:
     """Validate the model. Returns average loss & metrics."""
     model.eval()
@@ -183,7 +185,7 @@ def validate(
         images = batch["image"].to(device)
         masks = batch["mask"].to(device)
 
-        with autocast(device_type=device.type, enabled=(device.type == "cuda")):
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
             output = model(images)
             loss = criterion(output["seg"], masks)
 
@@ -235,19 +237,36 @@ def main():
     parser.add_argument("--output_dir", type=str, default="checkpoints", help="Checkpoint dir")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
 
+    # Performance
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2.0+, ~20-30%% speedup)")
+
     # Debug
     parser.add_argument("--max_steps", type=int, default=-1, help="Max steps per epoch (debug)")
 
     args = parser.parse_args()
 
-    # --- Device ---
+    # --- Device & Precision ---
     if torch.cuda.is_available():
         device = torch.device("cuda")
+        # Enable CUDA optimizations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Auto-detect BF16 support (Ampere+ GPUs: A100, RTX 30xx, etc.)
+        if torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+            print(f"Using device: {device} (BF16 — Ampere+ detected)")
+        else:
+            amp_dtype = torch.float16
+            print(f"Using device: {device} (FP16)")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
+        amp_dtype = torch.float32  # MPS doesn't support AMP well
+        print(f"Using device: {device} (FP32)")
     else:
         device = torch.device("cpu")
-    print(f"Using device: {device}")
+        amp_dtype = torch.float32
+        print(f"Using device: {device} (FP32)")
 
     # --- Datasets ---
     print("Loading training dataset...")
@@ -295,6 +314,12 @@ def main():
     print(f"  Total params:     {num_params:,}")
     print(f"  Trainable params: {trainable_params:,}")
 
+    # --- torch.compile ---
+    if args.compile:
+        print("  Compiling model with torch.compile...")
+        model = torch.compile(model)
+        print("  ✓ Model compiled (first batch will be slow due to compilation)")
+
     # --- Loss, Optimizer, Scheduler ---
     criterion = CombinedLoss(
         bce_weight=args.bce_weight, dice_weight=args.dice_weight
@@ -305,7 +330,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6
     )
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    # GradScaler only needed for FP16; BF16 and FP32 don't need it
+    use_scaler = (device.type == "cuda" and amp_dtype == torch.float16)
+    scaler = GradScaler(enabled=use_scaler)
 
     start_epoch = 0
     best_f1 = 0.0
@@ -346,12 +373,13 @@ def main():
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler,
             device, epoch, max_steps=args.max_steps, grad_clip=args.grad_clip,
+            amp_dtype=amp_dtype,
         )
 
         # Validate
         val_metrics = validate(
             model, val_loader, criterion, device, epoch,
-            max_steps=args.max_steps,
+            max_steps=args.max_steps, amp_dtype=amp_dtype,
         )
 
         # Step scheduler
