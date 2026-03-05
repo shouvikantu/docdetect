@@ -1,0 +1,34 @@
+# Dataset (LMDB files are large)
+dataset/
+
+# Checkpoints
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# TensorBoard
+tb_logs/
