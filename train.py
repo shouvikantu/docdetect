@@ -120,6 +120,8 @@ def train_one_epoch(
     max_steps: int = -1,
     grad_clip: float = 1.0,
     amp_dtype: torch.dtype = torch.float16,
+    scheduler=None,
+    step_scheduler_per_batch: bool = False,
 ) -> dict:
     """Train for one epoch. Returns average loss & metrics."""
     model.train()
@@ -155,6 +157,10 @@ def train_one_epoch(
         num_batches += 1
 
         pbar.set_postfix(loss=f"{loss.item():.4f}", f1=f"{metrics['f1']:.4f}")
+
+        # Step scheduler per batch if using OneCycleLR
+        if step_scheduler_per_batch and scheduler is not None:
+            scheduler.step()
 
     avg_loss = running_loss / max(num_batches, 1)
     avg_metrics = {k: v / max(num_batches, 1) for k, v in running_metrics.items()}
@@ -239,10 +245,15 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
 
     # Performance
-    parser.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2.0+, ~20-30%% speedup)")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2.0+)")
     parser.add_argument("--fast", action="store_true",
-        help="Use fast pipeline: 3ch RGB data loading + GPU forensic computation. "
-             "~5-10x faster data pipeline. Recommended for GPU training.")
+        help="Fast pipeline: RGB + GPU forensics. Recommended for GPU training.")
+    parser.add_argument("--max_samples", type=int, default=-1,
+        help="Limit training set to N samples (faster experiments)")
+    parser.add_argument("--no_cache", action="store_true",
+        help="Disable RAM caching of decoded images")
+    parser.add_argument("--onecycle", action="store_true",
+        help="Use OneCycleLR for aggressive convergence (fewer epochs needed)")
 
     # Debug
     parser.add_argument("--max_steps", type=int, default=-1, help="Max steps per epoch (debug)")
@@ -277,20 +288,23 @@ def main():
     mode_label = "FAST (RGB + GPU forensics)" if args.fast else "Standard (6ch CPU forensics)"
     print(f"Pipeline mode: {mode_label}")
 
+    # Build dataset kwargs
+    ds_kwargs = dict(lmdb_path=args.train_lmdb, image_size=args.image_size, split="train")
+    val_kwargs = dict(lmdb_path=args.val_lmdb, image_size=args.image_size, split="val")
+    if args.fast:
+        ds_kwargs["max_samples"] = args.max_samples
+        ds_kwargs["cache_in_ram"] = not args.no_cache
+        val_kwargs["cache_in_ram"] = not args.no_cache
+
     print("Loading training dataset...")
-    train_ds = DatasetClass(
-        lmdb_path=args.train_lmdb,
-        image_size=args.image_size,
-        split="train",
-    )
+    train_ds = DatasetClass(**ds_kwargs)
     print(f"  Training samples: {len(train_ds)}")
+    if not args.no_cache and args.fast:
+        est_gb = len(train_ds) * args.image_size * args.image_size * 4 / 1e9
+        print(f"  RAM cache estimate: ~{est_gb:.1f} GB (will fill during epoch 1)")
 
     print("Loading validation dataset...")
-    val_ds = DatasetClass(
-        lmdb_path=args.val_lmdb,
-        image_size=args.image_size,
-        split="val",
-    )
+    val_ds = DatasetClass(**val_kwargs)
     print(f"  Validation samples: {len(val_ds)}")
 
     use_persistent = args.num_workers > 0
@@ -341,9 +355,25 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6
-    )
+
+    steps_per_epoch = len(train_loader)
+    if args.max_steps > 0:
+        steps_per_epoch = min(steps_per_epoch, args.max_steps)
+
+    if args.onecycle:
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=args.lr,
+            steps_per_epoch=steps_per_epoch,
+            epochs=args.epochs,
+            pct_start=0.1,
+        )
+        step_scheduler_per_batch = True
+        print(f"  Scheduler: OneCycleLR (max_lr={args.lr}, {steps_per_epoch} steps/epoch)")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
+        step_scheduler_per_batch = False
     # GradScaler only needed for FP16; BF16 and FP32 don't need it
     use_scaler = (device.type == "cuda" and amp_dtype == torch.float16)
     scaler = GradScaler(enabled=use_scaler)
@@ -388,6 +418,8 @@ def main():
             model, train_loader, criterion, optimizer, scaler,
             device, epoch, max_steps=args.max_steps, grad_clip=args.grad_clip,
             amp_dtype=amp_dtype,
+            scheduler=scheduler if step_scheduler_per_batch else None,
+            step_scheduler_per_batch=step_scheduler_per_batch,
         )
 
         # Validate
@@ -396,8 +428,9 @@ def main():
             max_steps=args.max_steps, amp_dtype=amp_dtype,
         )
 
-        # Step scheduler
-        scheduler.step()
+        # Step scheduler per epoch (CosineAnnealing only)
+        if not step_scheduler_per_batch:
+            scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         elapsed = time.time() - t0
